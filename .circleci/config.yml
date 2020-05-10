@@ -19,6 +19,7 @@ make_tag: &make_tag
   name: make docker image tag
   command: |
     echo "export TAG=quay.io/encode-dcc/chip-seq-pipeline:${CIRCLE_BRANCH}_${CIRCLE_WORKFLOW_ID}" > ${BASH_ENV}
+    echo "export TAG_DOCKERHUB=encodedcc/chip-seq-pipeline:${CIRCLE_BRANCH}_${CIRCLE_WORKFLOW_ID}" >> ${BASH_ENV}
 
 install_singularity: &install_singularity
   name: install singularity
@@ -57,7 +58,7 @@ jobs:
             docker login -u=${QUAY_ROBOT_USER} -p=${QUAY_ROBOT_USER_TOKEN} quay.io
             docker build --cache-from quay.io/encode-dcc/chip-seq-pipeline:${DOCKER_CACHE_TAG} --build-arg GIT_COMMIT_HASH=${CIRCLE_SHA1} --build-arg BRANCH=${CIRCLE_BRANCH} --build-arg BUILD_TAG=${TAG} -t $TAG -f dev/docker_image/Dockerfile .
             docker push ${TAG}
-            # docker push quay.io/encode-dcc/chip-seq-pipeline:template
+            #docker push ${TAG_DOCKERHUB}
             docker logout
   test_tasks:
     <<: *machine_defaults
@@ -77,7 +78,9 @@ jobs:
               json=${wdl%.*}.json
               result=${wdl%.*}.result.json
               ./test.sh ${wdl} ${json} ${TAG}
-              python -c "import sys; import json; data=json.loads(sys.stdin.read()); sys.exit(int(not data[u'match_overall']))" < ${result}
+              if [[ $(wc -l "${result}" | awk '{print $1}') > 1 ]]; then
+                python -c "import sys; import json; data=json.loads(sys.stdin.read()); sys.exit(int(not data[u'match_overall']))" < ${result}
+              fi
               rm -f ${result}
             done
             
@@ -95,6 +98,21 @@ jobs:
             echo ${GCLOUD_SERVICE_ACCOUNT_SECRET_JSON} > tmp_key.json
             ./test_chip.sh ENCSR000DYI_subsampled_chr19_only.json tmp_key.json ${TAG}
             python -c "import sys; import json; data=json.loads(sys.stdin.read()); sys.exit(int(not data[u'outputs'][u'chip.qc_json_ref_match']))" < ENCSR000DYI_subsampled_chr19_only.metadata.json
+
+  test_workflow_ctl_sub_se:
+    <<: *machine_defaults
+    steps:
+      - checkout
+      - run: *make_tag
+      - run:
+          no_output_timeout: 300m
+          command: |
+            source ${BASH_ENV}
+            gcloud --quiet config set project ${GOOGLE_PROJECT_ID}
+            cd dev/test/test_workflow/
+            echo ${GCLOUD_SERVICE_ACCOUNT_SECRET_JSON} > tmp_key.json
+            ./test_chip.sh ENCSR000DYI_subsampled_ctl_sub_chr19_only.json tmp_key.json ${TAG}
+            python -c "import sys; import json; data=json.loads(sys.stdin.read()); sys.exit(int(not data[u'outputs'][u'chip.qc_json_ref_match']))" < ENCSR000DYI_subsampled_ctl_sub_chr19_only.metadata.json
 
   test_workflow_unrep_se:
     <<: *machine_defaults
@@ -125,6 +143,36 @@ jobs:
             echo ${GCLOUD_SERVICE_ACCOUNT_SECRET_JSON} > tmp_key.json
             ./test_chip.sh ENCSR936XTK_subsampled_chr19_only.json tmp_key.json ${TAG}
             python -c "import sys; import json; data=json.loads(sys.stdin.read()); sys.exit(int(not data[u'outputs'][u'chip.qc_json_ref_match']))" < ENCSR936XTK_subsampled_chr19_only.metadata.json
+
+  test_workflow_ctl_sub_pe:
+    <<: *machine_defaults
+    steps:
+      - checkout
+      - run: *make_tag
+      - run:
+          no_output_timeout: 300m
+          command: |
+            source ${BASH_ENV}
+            gcloud --quiet config set project ${GOOGLE_PROJECT_ID}
+            cd dev/test/test_workflow/
+            echo ${GCLOUD_SERVICE_ACCOUNT_SECRET_JSON} > tmp_key.json
+            ./test_chip.sh ENCSR936XTK_subsampled_ctl_sub_chr19_only.json tmp_key.json ${TAG}
+            python -c "import sys; import json; data=json.loads(sys.stdin.read()); sys.exit(int(not data[u'outputs'][u'chip.qc_json_ref_match']))" < ENCSR936XTK_subsampled_ctl_sub_chr19_only.metadata.json
+
+  test_workflow_ctl_sub_1ctl_pe:
+    <<: *machine_defaults
+    steps:
+      - checkout
+      - run: *make_tag
+      - run:
+          no_output_timeout: 300m
+          command: |
+            source ${BASH_ENV}
+            gcloud --quiet config set project ${GOOGLE_PROJECT_ID}
+            cd dev/test/test_workflow/
+            echo ${GCLOUD_SERVICE_ACCOUNT_SECRET_JSON} > tmp_key.json
+            ./test_chip.sh ENCSR936XTK_subsampled_ctl_sub_1ctl_chr19_only.json tmp_key.json ${TAG}
+            python -c "import sys; import json; data=json.loads(sys.stdin.read()); sys.exit(int(not data[u'outputs'][u'chip.qc_json_ref_match']))" < ENCSR936XTK_subsampled_ctl_sub_1ctl_chr19_only.metadata.json
 
   test_workflow_hist_se:
     <<: *machine_defaults
@@ -184,10 +232,19 @@ workflows:
       - test_workflow_se:
           requires:
             - build
+      - test_workflow_ctl_sub_se:
+          requires:
+            - build
       - test_workflow_unrep_se:
           requires:
             - build
       - test_workflow_pe:
+          requires:
+            - build
+      - test_workflow_ctl_sub_pe:
+          requires:
+            - build
+      - test_workflow_ctl_sub_1ctl_pe:
           requires:
             - build
       - test_workflow_hist_se:

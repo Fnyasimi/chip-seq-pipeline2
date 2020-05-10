@@ -1,12 +1,18 @@
-# ENCODE TF/Histone ChIP-Seq pipeline
-# Author: Jin Lee (leepc12@gmail.com)
-
-#CAPER docker quay.io/encode-dcc/chip-seq-pipeline:v1.3.5.1
-#CAPER singularity docker://quay.io/encode-dcc/chip-seq-pipeline:v1.3.5.1
-#CROO out_def https://storage.googleapis.com/encode-pipeline-output-definition/chip.croo.v3.json
+#CAPER docker quay.io/encode-dcc/chip-seq-pipeline:v1.4.0.1
+#CAPER singularity docker://quay.io/encode-dcc/chip-seq-pipeline:v1.4.0.1
+#CROO out_def https://storage.googleapis.com/encode-pipeline-output-definition/chip.croo.v4.json
 
 workflow chip {
-	String pipeline_ver = 'v1.3.5.1'
+	meta {
+		author: 'Jin wook Lee (leepc12@gmail.com) at ENCODE-DCC'
+		description: 'ENCODE TF/Histone ChIP-Seq pipeline'
+
+		caper_docker: 'quay.io/encode-dcc/chip-seq-pipeline:v1.4.0.1'
+		caper_singularity: 'docker://quay.io/encode-dcc/chip-seq-pipeline:v1.4.0.1'
+		croo_out_def: 'https://storage.googleapis.com/encode-pipeline-output-definition/chip.croo.v4.json'
+	}
+	# pipeline version
+	String pipeline_ver = 'v1.4.0.1'
 	### sample name, description
 	String title = 'Untitled'
 	String description = 'No description'
@@ -63,7 +69,9 @@ workflow chip {
 	# parameters for aligner and filter
 	Boolean use_bwa_mem_for_pe = false # THIS IS EXPERIMENTAL and BWA ONLY (use bwa mem instead of bwa aln/sam)
 									# available only for PE dataset with READ_LEN>=70bp
-	Int xcor_pe_trim_bp = 50 		# for cross-correlation analysis only (R1 of paired-end fastqs)
+	Int crop_length = 0 			# crop reads in FASTQs with Trimmomatic (0 by default, i.e. disabled)
+	Int crop_length_tol = 2 	# keep shorter reads around crop_length
+	Int xcor_trim_bp = 50 			# for cross-correlation analysis only (R1 of paired-end fastqs)
 	Boolean use_filt_pe_ta_for_xcor = false # PE only. use filtered PE BAM for cross-corr.
 	String dup_marker = 'picard'	# picard, sambamba
 	Boolean no_dup_removal = false	# keep all dups in final BAM
@@ -76,6 +84,9 @@ workflow chip {
 	Int subsample_reads = 0			# number of reads to subsample TAGALIGN
 									# 0 for no subsampling. this affects all downstream analysis
 	Int ctl_subsample_reads = 0		# number of reads to subsample control TAGALIGN
+	Int ctl_depth_limit = 200000000
+	Float exp_ctl_depth_ratio_limit = 5.0
+
 	Int xcor_subsample_reads = 15000000 # subsample TAG-ALIGN for xcor only (not used for other downsteam analyses)
 	Int xcor_exclusion_range_min = -500
 	Int? xcor_exclusion_range_max
@@ -87,7 +98,8 @@ workflow chip {
 	Int? cap_num_peak
 	Int cap_num_peak_spp = 300000	# cap number of raw peaks called from SPP
 	Int cap_num_peak_macs2 = 500000	# cap number of raw peaks called from MACS2
-	Float pval_thresh = 0.01		# p.value threshold
+	Float pval_thresh = 0.01		# p.value threshold (for MACS2 peak caller only)
+	Float fdr_thresh = 0.01			# FDR threshold (for SPP peak caller only: Rscript run_spp.R -fdr)
 	Float idr_thresh = 0.05			# IDR threshold
 
 	### resources
@@ -127,6 +139,7 @@ workflow chip {
 	Int call_peak_time_hr = 72
 	String call_peak_disks = 'local-disk 200 HDD'
 
+	String? align_trimmomatic_java_heap
 	String? filter_picard_java_heap
 	String? gc_bias_picard_java_heap
 
@@ -375,9 +388,19 @@ workflow chip {
 			msg = 'No genome database found in your input JSON. Did you define "chip.genome_tsv" correctly?'
 		}
 	}
-	if ( peak_caller_ == 'spp' && num_ctl == 0 ) {
+	if ( !align_only && peak_caller_ == 'spp' && num_ctl == 0 ) {
 		call raise_exception as error_control_required { input:
 			msg = 'SPP requires control inputs. Define control input files ("chip.ctl_*") in an input JSON file.'
+		}
+	}
+	if ( ( ctl_depth_limit > 0 || exp_ctl_depth_ratio_limit > 0 ) && num_ctl > 1 && length(ctl_paired_ends) > 1  ) {
+		call raise_exception as error_subsample_pooled_control_with_mixed_endedness { input:
+			msg = 'Cannot use automatic control subsampling ("chip.ctl_depth_limit">0 and "chip.exp_ctl_depth_limit">0) for ' +
+			      'multiple controls with mixed endedness (e.g. SE ctl-rep1 and PE ctl-rep2). ' +
+			      'Automatic control subsampling is enabled by default. ' +
+			      'Disable automatic control subsampling by explicitly defining the above two parameters as 0 in your input JSON file. ' +
+			      'You can still use manual control subsamping ("chip.ctl_subsample_reads">0) since it is done ' +
+			      'for individual control\'s TAG-ALIGN output according to each control\'s endedness. '
 		}
 	}
 
@@ -394,6 +417,8 @@ workflow chip {
 			call align { input :
 				fastqs_R1 = fastqs_R1[i],
 				fastqs_R2 = fastqs_R2[i],
+				crop_length = crop_length,
+				crop_length_tol = crop_length_tol,
 
 				aligner = aligner_,
 				mito_chr_name = mito_chr_name_,
@@ -403,6 +428,8 @@ workflow chip {
 					else custom_aligner_idx_tar_,
 				paired_end = paired_end_,
 				use_bwa_mem_for_pe = use_bwa_mem_for_pe,
+
+				trimmomatic_java_heap = align_trimmomatic_java_heap,
 				cpu = align_cpu,
 				mem_mb = align_mem_mb,
 				time_hr = align_time_hr,
@@ -482,7 +509,9 @@ workflow chip {
 			call align as align_R1 { input :
 				fastqs_R1 = fastqs_R1[i],
 				fastqs_R2 = [],
-				trim_bp = xcor_pe_trim_bp,
+				trim_bp = xcor_trim_bp,
+				crop_length = 0,
+				crop_length_tol = 0,
 
 				aligner = aligner_,
 				mito_chr_name = mito_chr_name_,
@@ -492,6 +521,7 @@ workflow chip {
 					else custom_aligner_idx_tar_,
 				paired_end = false,
 				use_bwa_mem_for_pe = use_bwa_mem_for_pe,
+
 				cpu = align_cpu,
 				mem_mb = align_mem_mb,
 				time_hr = align_time_hr,
@@ -607,6 +637,8 @@ workflow chip {
 			call align as align_ctl { input :
 				fastqs_R1 = ctl_fastqs_R1[i],
 				fastqs_R2 = ctl_fastqs_R2[i],
+				crop_length = crop_length,
+				crop_length_tol = crop_length_tol,
 
 				aligner = aligner_,
 				mito_chr_name = mito_chr_name_,
@@ -616,6 +648,8 @@ workflow chip {
 					else custom_aligner_idx_tar_,
 				paired_end = ctl_paired_end_,
 				use_bwa_mem_for_pe = use_bwa_mem_for_pe,
+
+				trimmomatic_java_heap = align_trimmomatic_java_heap,
 				cpu = align_cpu,
 				mem_mb = align_mem_mb,
 				time_hr = align_time_hr,
@@ -731,7 +765,7 @@ workflow chip {
 
 	Boolean has_all_input_of_choose_ctl = length(select_all(ta_))==num_rep
 		&& length(select_all(ctl_ta_))==num_ctl && num_ctl > 0
-	if ( has_all_input_of_choose_ctl ) {
+	if ( has_all_input_of_choose_ctl && !align_only ) {
 		# choose appropriate control for each exp IP replicate
 		# outputs:
 		# 	choose_ctl.idx : control replicate index for each exp replicate 
@@ -743,13 +777,31 @@ workflow chip {
 			ctl_ta_pooled = pool_ta_ctl.ta_pooled,
 			always_use_pooled_ctl = always_use_pooled_ctl,
 			ctl_depth_ratio = ctl_depth_ratio,
+			ctl_depth_limit = ctl_depth_limit,
+			exp_ctl_depth_ratio_limit = exp_ctl_depth_ratio_limit,
 		}
 	}
 
-	# make control ta array [[1,2,3,4]] -> [[1],[2],[3],[4]], will be zipped with exp ta array latter
-	Array[Array[File]] chosen_ctl_tas =
-		if has_all_input_of_choose_ctl then transpose(select_all([choose_ctl.chosen_ctl_tas]))
-		else [[],[],[],[],[],[],[],[],[],[]]
+	scatter(i in range(num_rep)) {
+		# make control ta array [[1,2,3,4]] -> [[1],[2],[3],[4]]
+		# chosen_ctl_ta_id
+		# 	>=0: control TA index (this means that control TA with this index exists)
+		# 	-1: use pooled control
+		#	-2: there is no control
+		Int chosen_ctl_ta_id = if has_all_input_of_choose_ctl && !align_only then
+			select_first([choose_ctl.chosen_ctl_ta_ids])[i] else -2
+		Array[File] chosen_ctl_tas = if chosen_ctl_ta_id == -2 then []
+			else if chosen_ctl_ta_id == -1 then [ select_first([pool_ta_ctl.ta_pooled]) ]
+			else [ select_first([ctl_ta_[ chosen_ctl_ta_id ]]) ]
+
+		Int chosen_ctl_ta_subsample = if has_all_input_of_choose_ctl && !align_only then
+			select_first([choose_ctl.chosen_ctl_ta_subsample])[i] else 0
+		Boolean chosen_ctl_paired_end = if chosen_ctl_ta_id == -2 then false
+			else if chosen_ctl_ta_id == -1 then select_first(ctl_paired_end_)
+			else select_first([ctl_paired_end_[chosen_ctl_ta_id]])
+	}
+	Int chosen_ctl_ta_pooled_subsample = if has_all_input_of_choose_ctl && !align_only then
+		select_first([choose_ctl.chosen_ctl_ta_subsample_pooled]) else 0
 
 	# workaround for dx error (Unsupported combination: womType: Int womValue: ([225], Array[Int]))
 	Array[Int] fraglen_tmp = select_all(fraglen_)
@@ -767,7 +819,10 @@ workflow chip {
 				gensz = gensz_,
 				chrsz = chrsz_,
 				cap_num_peak = cap_num_peak_,
+				ctl_subsample = chosen_ctl_ta_subsample[i],
+				ctl_paired_end = chosen_ctl_paired_end[i],
 				pval_thresh = pval_thresh,
+				fdr_thresh = fdr_thresh,
 				fraglen = fraglen_tmp[i],
 				blacklist = blacklist_,
 				regex_bfilt_peak_chr_name = regex_bfilt_peak_chr_name_,
@@ -788,6 +843,8 @@ workflow chip {
 				gensz = gensz_,
 				chrsz = chrsz_,
 				pval_thresh = pval_thresh,
+				ctl_subsample = chosen_ctl_ta_subsample[i],
+				ctl_paired_end = chosen_ctl_paired_end[i],
 				fraglen = fraglen_tmp[i],
 
 				mem_mb = macs2_signal_track_mem_mb,
@@ -808,7 +865,10 @@ workflow chip {
 				gensz = gensz_,
 				chrsz = chrsz_,
 				cap_num_peak = cap_num_peak_,
+				ctl_subsample = chosen_ctl_ta_subsample[i],
+				ctl_paired_end = chosen_ctl_paired_end[i],
 				pval_thresh = pval_thresh,
+				fdr_thresh = fdr_thresh,
 				fraglen = fraglen_tmp[i],
 				blacklist = blacklist_,
 				regex_bfilt_peak_chr_name = regex_bfilt_peak_chr_name_,
@@ -834,7 +894,10 @@ workflow chip {
 				gensz = gensz_,
 				chrsz = chrsz_,
 				cap_num_peak = cap_num_peak_,
+				ctl_subsample = chosen_ctl_ta_subsample[i],
+				ctl_paired_end = chosen_ctl_paired_end[i],
 				pval_thresh = pval_thresh,
+				fdr_thresh = fdr_thresh,
 				fraglen = fraglen_tmp[i],
 				blacklist = blacklist_,
 				regex_bfilt_peak_chr_name = regex_bfilt_peak_chr_name_,
@@ -859,9 +922,11 @@ workflow chip {
 	# }
 
 	# actually not an array
-	Array[File?] chosen_ctl_ta_pooled = if !has_all_input_of_choose_ctl then []
+	Array[File?] chosen_ctl_ta_pooled = if !has_all_input_of_choose_ctl || align_only then []
 		else if num_ctl < 2 then [ctl_ta_[0]] # choose first (only) control
 		else select_all([pool_ta_ctl.ta_pooled]) # choose pooled control
+	Boolean chosen_ctl_ta_pooled_paired_end = if !has_all_input_of_choose_ctl || align_only then false
+		else select_first(ctl_paired_end_)
 
 	Boolean has_input_of_call_peak_pooled = defined(pool_ta.ta_pooled)
 	Boolean has_output_of_call_peak_pooled = defined(peak_pooled)
@@ -876,7 +941,10 @@ workflow chip {
 			gensz = gensz_,
 			chrsz = chrsz_,
 			cap_num_peak = cap_num_peak_,
+			ctl_subsample = chosen_ctl_ta_pooled_subsample,
+			ctl_paired_end = chosen_ctl_ta_pooled_paired_end,
 			pval_thresh = pval_thresh,
+			fdr_thresh = fdr_thresh,
 			fraglen = fraglen_mean.rounded_mean,
 			blacklist = blacklist_,
 			regex_bfilt_peak_chr_name = regex_bfilt_peak_chr_name_,
@@ -897,6 +965,8 @@ workflow chip {
 			gensz = gensz_,
 			chrsz = chrsz_,
 			pval_thresh = pval_thresh,
+			ctl_subsample = chosen_ctl_ta_pooled_subsample,
+			ctl_paired_end = chosen_ctl_ta_pooled_paired_end,
 			fraglen = fraglen_mean.rounded_mean,
 
 			mem_mb = macs2_signal_track_mem_mb,
@@ -918,6 +988,9 @@ workflow chip {
 			chrsz = chrsz_,
 			cap_num_peak = cap_num_peak_,
 			pval_thresh = pval_thresh,
+			ctl_subsample = chosen_ctl_ta_pooled_subsample,
+			ctl_paired_end = chosen_ctl_ta_pooled_paired_end,
+			fdr_thresh = fdr_thresh,
 			fraglen = fraglen_mean.rounded_mean,
 			blacklist = blacklist_,
 			regex_bfilt_peak_chr_name = regex_bfilt_peak_chr_name_,
@@ -944,6 +1017,9 @@ workflow chip {
 			chrsz = chrsz_,
 			cap_num_peak = cap_num_peak_,
 			pval_thresh = pval_thresh,
+			ctl_subsample = chosen_ctl_ta_pooled_subsample,
+			ctl_paired_end = chosen_ctl_ta_pooled_paired_end,
+			fdr_thresh = fdr_thresh,
 			fraglen = fraglen_mean.rounded_mean,
 			blacklist = blacklist_,
 			regex_bfilt_peak_chr_name = regex_bfilt_peak_chr_name_,
@@ -1119,7 +1195,7 @@ workflow chip {
 		cap_num_peak = cap_num_peak_,
 		idr_thresh = idr_thresh,
 		pval_thresh = pval_thresh,
-		xcor_pe_trim_bp = xcor_pe_trim_bp,
+		xcor_trim_bp = xcor_trim_bp,
 		xcor_subsample_reads = xcor_subsample_reads,
 
 		samstat_qcs = align.samstat_qc,
@@ -1182,7 +1258,8 @@ task align {
 	Array[File] fastqs_R1 		# [merge_id]
 	Array[File] fastqs_R2
 	Int? trim_bp			# this is for R1 only
-
+	Int crop_length
+	Int crop_length_tol
 	String aligner
 	String mito_chr_name
 	Int? multimapping
@@ -1191,6 +1268,8 @@ task align {
 	Boolean paired_end
 	Boolean use_bwa_mem_for_pe
 
+	Float trimmomatic_java_heap_factor = 0.9
+	String? trimmomatic_java_heap
 	Int cpu
 	Int mem_mb
 	Int time_hr
@@ -1215,7 +1294,7 @@ task align {
 		python3 $(which encode_task_merge_fastq.py) \
 			${write_tsv(tmp_fastqs)} \
 			${if paired_end then '--paired-end' else ''} \
-			${'--nth ' + 1}
+			${'--nth ' + cpu}
 
 		if [ -z '${trim_bp}' ]; then
 			SUFFIX=
@@ -1231,6 +1310,22 @@ task align {
 					--trim-bp ${trim_bp} \
 					--out-dir R2$SUFFIX
 			fi
+		fi
+		if [ '${crop_length}' == '0' ]; then
+			SUFFIX=$SUFFIX
+		else
+			NEW_SUFFIX="$SUFFIX"_cropped
+			python3 $(which encode_task_trimmomatic.py) \
+				--fastq1 R1$SUFFIX/*.fastq.gz \
+				${if paired_end then '--fastq2 R2$SUFFIX/*.fastq.gz' else ''} \
+				${if paired_end then '--paired-end' else ''} \
+				--crop-length ${crop_length} \
+				--crop-length-tol "${crop_length_tol}" \
+				--out-dir-R1 R1$NEW_SUFFIX \
+				${if paired_end then '--out-dir-R2 R2$NEW_SUFFIX' else ''} \
+				${'--trimmomatic-java-heap ' + if defined(trimmomatic_java_heap) then trimmomatic_java_heap else (round(mem_mb * trimmomatic_java_heap_factor) + 'M')} \
+				${'--nth ' + cpu}
+			SUFFIX=$NEW_SUFFIX
 		fi
 
 		if [ '${aligner}' == 'bwa' ]; then
@@ -1293,6 +1388,7 @@ task filter {
 
 	Int cpu
 	Int mem_mb
+	Float picard_java_heap_factor = 0.9
 	String? picard_java_heap
 	Int time_hr
 	String disks
@@ -1309,7 +1405,7 @@ task filter {
 			${if no_dup_removal then '--no-dup-removal' else ''} \
 			${'--mito-chr-name ' + mito_chr_name} \
 			${'--nth ' + cpu} \
-			${'--picard-java-heap ' + if defined(picard_java_heap) then picard_java_heap else (mem_mb + 'M')}
+			${'--picard-java-heap ' + if defined(picard_java_heap) then picard_java_heap else (round(mem_mb * picard_java_heap_factor) + 'M')}
 	}
 	output {
 		File nodup_bam = glob('*.bam')[0]
@@ -1483,6 +1579,9 @@ task choose_ctl {
 	Boolean always_use_pooled_ctl # always use pooled control for all exp rep.
 	Float ctl_depth_ratio 		# if ratio between controls is higher than this
 								# then always use pooled control for all exp rep.
+	Int ctl_depth_limit
+	Float exp_ctl_depth_ratio_limit
+
 	command {
 		python3 $(which encode_task_choose_ctl.py) \
 			--tas ${sep=' ' tas} \
@@ -1490,10 +1589,14 @@ task choose_ctl {
 			${'--ta-pooled ' + ta_pooled} \
 			${'--ctl-ta-pooled ' + ctl_ta_pooled} \
 			${if always_use_pooled_ctl then '--always-use-pooled-ctl' else ''} \
-			${'--ctl-depth-ratio ' + ctl_depth_ratio}
+			${'--ctl-depth-ratio ' + ctl_depth_ratio} \
+			${'--ctl-depth-limit ' + ctl_depth_limit} \
+			${'--exp-ctl-depth-ratio-limit ' + exp_ctl_depth_ratio_limit}
 	}
 	output {
-		Array[File] chosen_ctl_tas = glob('ctl_for_rep*.tagAlign.gz')
+		Array[Int] chosen_ctl_ta_ids = read_lines(glob('chosen_ctl.tsv')[0])
+		Array[Int] chosen_ctl_ta_subsample = read_lines(glob('chosen_ctl_subsample.tsv')[0])
+		Int chosen_ctl_ta_subsample_pooled = read_int(glob('chosen_ctl_subsample_pooled.txt')[0])
 	}
 	runtime {
 		cpu : 1
@@ -1528,14 +1631,17 @@ task call_peak {
 	String peak_caller
 	String peak_type
 	File? custom_call_peak_py
-
 	Array[File?] tas	# [ta, control_ta]. control_ta is optional
 	Int fraglen 		# fragment length from xcor
 	String gensz		# Genome size (sum of entries in 2nd column of 
                         # chr. sizes file, or hs for human, ms for mouse)
 	File chrsz			# 2-col chromosome sizes file
 	Int cap_num_peak	# cap number of raw peaks called from MACS2
-	Float pval_thresh 	# p.value threshold
+	Int ctl_subsample	# subsample control if >0. 0: no subsampling
+	Boolean ctl_paired_end # control is paired end
+	Float pval_thresh 	# p.value threshold for MACS2
+	Float? fdr_thresh 	# FDR threshold for SPP
+
 	File? blacklist 	# blacklist BED to filter raw peaks
 	String? regex_bfilt_peak_chr_name
 
@@ -1554,6 +1660,8 @@ task call_peak {
 				${'--chrsz ' + chrsz} \
 				${'--fraglen ' + fraglen} \
 				${'--cap-num-peak ' + cap_num_peak} \
+				${'--ctl-subsample ' + ctl_subsample} \
+				${if ctl_paired_end then '--ctl-paired-end' else ''} \
 				${'--pval-thresh '+ pval_thresh}
 
 		elif [ '${peak_caller}' == 'spp' ]; then
@@ -1561,8 +1669,10 @@ task call_peak {
 				${sep=' ' tas} \
 				${'--fraglen ' + fraglen} \
 				${'--cap-num-peak ' + cap_num_peak} \
+				${'--ctl-subsample ' + ctl_subsample} \
+				${if ctl_paired_end then '--ctl-paired-end' else ''} \
+				${'--fdr-thresh '+ fdr_thresh} \
 				${'--nth ' + cpu}
-
 		else
 			python3 ${custom_call_peak_py} \
 				${sep=' ' tas} \
@@ -1570,7 +1680,10 @@ task call_peak {
 				${'--chrsz ' + chrsz} \
 				${'--fraglen ' + fraglen} \
 				${'--cap-num-peak ' + cap_num_peak} \
-				${'--pval-thresh '+ pval_thresh}
+				${'--ctl-subsample ' + ctl_subsample}
+				${if ctl_paired_end then '--ctl-paired-end' else ''} \
+				${'--pval-thresh '+ pval_thresh} \
+				${'--fdr-thresh '+ fdr_thresh} \
 				${'--nth ' + cpu}
 		fi
 
@@ -1611,6 +1724,8 @@ task macs2_signal_track {
 	String gensz		# Genome size (sum of entries in 2nd column of 
                         # chr. sizes file, or hs for human, ms for mouse)
 	File chrsz			# 2-col chromosome sizes file
+	Int ctl_subsample	# subsample control if >0. 0: no subsampling
+	Boolean ctl_paired_end # control is paired end	
 	Float pval_thresh 	# p.value threshold
 
 	Int mem_mb
@@ -1623,7 +1738,9 @@ task macs2_signal_track {
 			${'--gensz '+ gensz} \
 			${'--chrsz ' + chrsz} \
 			${'--fraglen ' + fraglen} \
-			${'--pval-thresh '+ pval_thresh}
+			${'--pval-thresh '+ pval_thresh} \
+			${'--ctl-subsample ' + ctl_subsample} \
+			${if ctl_paired_end then '--ctl-paired-end' else ''}
 	}
 	output {
 		File pval_bw = glob('*.pval.signal.bigwig')[0]
@@ -1777,13 +1894,15 @@ task gc_bias {
 	File nodup_bam
 	File ref_fa
 
+	Int mem_mb = 10000
+	Float picard_java_heap_factor = 0.9
 	String? picard_java_heap
 
 	command {
 		python3 $(which encode_task_gc_bias.py) \
 			${'--nodup-bam ' + nodup_bam} \
 			${'--ref-fa ' + ref_fa} \
-			${'--picard-java-heap ' + if defined(picard_java_heap) then picard_java_heap else '10G'}
+			${'--picard-java-heap ' + if defined(picard_java_heap) then picard_java_heap else (round(mem_mb * picard_java_heap_factor) + 'M')}
 	}
 	output {
 		File gc_plot = glob('*.gc_plot.png')[0]
@@ -1791,8 +1910,8 @@ task gc_bias {
 	}
 	runtime {
 		cpu : 1
-		memory : '10000 MB'
-		time : 1
+		memory : '${mem_mb} MB'
+		time : 6
 		disks : 'local-disk 100 HDD'
 	}
 }
@@ -1816,7 +1935,7 @@ task qc_report {
 	Int cap_num_peak
 	Float idr_thresh
 	Float pval_thresh
-	Int xcor_pe_trim_bp
+	Int xcor_trim_bp
 	Int xcor_subsample_reads
 	# QCs
 	Array[File?] samstat_qcs
@@ -1880,7 +1999,7 @@ task qc_report {
 			${'--cap-num-peak ' + cap_num_peak} \
 			--idr-thresh ${idr_thresh} \
 			--pval-thresh ${pval_thresh} \
-			--xcor-pe-trim-bp ${xcor_pe_trim_bp} \
+			--xcor-trim-bp ${xcor_trim_bp} \
 			--xcor-subsample-reads ${xcor_subsample_reads} \
 			--samstat-qcs ${sep='_:_' samstat_qcs} \
 			--nodup-samstat-qcs ${sep='_:_' nodup_samstat_qcs} \
@@ -2023,8 +2142,10 @@ task rounded_mean {
 
 task raise_exception {
 	String msg
+	Array[String]? vals
 	command {
 		echo -e "\n* Error: ${msg}\n" >&2
+		echo -e "* Vals: ${sep=',' vals}\n" >&2
 		exit 2
 	}
 	output {
